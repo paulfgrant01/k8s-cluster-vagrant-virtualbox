@@ -1,0 +1,275 @@
+- name: Config All
+  hosts: all
+  gather_facts: yes
+  become: yes
+  become_user: root
+  vars:
+    version: 1.20.1-00
+
+  tasks:
+  - name: Update Hosts File
+    lineinfile:
+      path: /etc/hosts 
+      line: "{{ item.ip }} {{ item.name }}"
+    loop:
+      - { name: 'cp-cp1', ip: '192.168.33.10'}
+      - { name: 'c1-node1', ip: '192.168.33.11'}
+      - { name: 'c1-node2', ip: '192.168.33.12'}
+      - { name: 'c1-node3', ip: '192.168.33.13'}
+    when: inventory_hostname != item.name
+
+  - name: Disable SWAP since kubernetes can't work with swap enabled (1/2)
+    shell: swapoff -a
+
+  - name: Disable SWAP in fstab since kubernetes can't work with swap enabled (2/2)
+    replace:
+      path: /etc/fstab
+      regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+      replace: '# \1'
+
+  - name: ModProbe overlay
+    shell: modprobe overlay
+
+  - name: br_netfilter overlay
+    shell: modprobe br_netfilter
+
+  - name: Update modules-load.d/containerd.conf
+    lineinfile:
+      path: /etc/modules-load.d/containerd.conf
+      line: "{{ item }}"
+      state: present
+      create: yes
+    loop:
+      - overlay
+      - br_netfilter
+
+  - name: Update /etc/sysctl.d/99-kubernetes-cri.conf
+    lineinfile:
+      path: /etc/sysctl.d/99-kubernetes-cri.conf
+      line: "{{ item }}"
+      state: present
+      create: yes
+    loop:
+      - "net.bridge.bridge-nf-call-iptables  = 1"
+      - "net.ipv4.ip_forward                 = 1"
+      - "net.bridge.bridge-nf-call-ip6tables = 1"
+
+  - name: Apply sysctl params without reboot
+    shell: sysctl --system
+
+  - debug:
+      var: inventory_hostname
+
+  - name: Run the equivalent of "apt-get update" as a separate step
+    apt:
+      update_cache: yes
+
+  - name: Install containerd 
+    apt:
+      name: containerd
+      state: present
+
+  - name: Create a directory if it does not exist
+    file:
+      path: /etc/containerd
+      state: directory
+      mode: '0755'
+
+  - name: Write dfault config for containerd
+    shell: containerd config default>/etc/containerd/config.toml
+
+  - name: Change line in file for systemcgroup
+    lineinfile:
+      path: /etc/containerd/config.toml
+      regexp: '\s*SystemdCgroup'
+      line: '            SystemdCgroup = true'
+      backrefs: yes
+      state: present
+
+  - name: Restart containerd
+    ansible.builtin.systemd:
+      state: restarted
+      daemon_reload: yes
+      name: containerd
+
+  - name: Add Google's apt repository gpg key
+    shell: curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+
+  - name: Add the kubernetes apt repository
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+
+  - name: Run the equivalent of "apt-get update" as a separate step
+    apt:
+      update_cache: yes
+
+  - name: Install Kubelet
+    apt:
+      name: "kubelet={{ version }}"
+      state: present
+
+  - name: Install Kubeadm
+    apt:
+      name: "kubeadm={{ version }}"
+      state: present
+
+  - name: Install Kubectl
+    apt:
+      name: "kubectl={{ version }}"
+      state: present
+      force: yes
+
+  - name: Prevent kubelet from being upgraded
+    dpkg_selections:
+      name: kubelet
+      selection: hold
+
+  - name: Prevent kubeadm from being upgraded
+    dpkg_selections:
+      name: kubeadm
+      selection: hold
+
+  - name: Prevent kubectl from being upgraded
+    dpkg_selections:
+      name: kubectl
+      selection: hold
+
+  - name: Enable service kubelet.service and ensure it is not masked
+    systemd:
+      name: kubelet.service
+      enabled: yes
+      masked: no
+
+  - name: Enable service containerd.service and ensure it is not masked
+    systemd:
+      name: containerd.service
+      enabled: yes
+      masked: no
+      state: started
+
+- name: Configure Control plane
+  hosts: 
+    cp-cp1
+  gather_facts: yes
+  become: yes
+  become_user: root
+  vars:
+    cp_host_ip: 192.168.33.10
+    cluster_config: /config/ClusterConfiguration.yaml
+    cri_socket: /run/containerd/containerd.sock
+    kube_config: /etc/kubernetes/admin.conf
+    calico_yaml: /downloads/calico.yaml
+    calico_created: /etc/kubernetes/calico.created
+
+  tasks:
+  - name: Create download directory
+    file:
+      path: /downloads
+      state: directory
+
+  - name: Download Calico manifest
+    get_url:
+      url: https://docs.projectcalico.org/manifests/calico.yaml
+      dest: "{{ calico_yaml }}"
+      mode: '0444'
+
+  - name: Create config dir on control plane
+    file:
+      path: /config
+      state: directory
+
+  - name: Output kubeadm init config values
+    shell: "kubeadm config print init-defaults | tee {{ cluster_config }}"
+    args:
+      creates: "{{ cluster_config }}"
+
+  - name: Change advertiseAddress in config file cp_host_ip
+    lineinfile:
+      path: "{{ cluster_config }}"
+      regexp: '\s*advertiseAddress'
+      line: "  advertiseAddress: {{ cp_host_ip }}"
+      backrefs: yes
+      state: present
+
+  - name: Change criSocket in config file to containerd
+    lineinfile:
+      path: "{{ cluster_config }}"
+      regexp: '\s*criSocket'
+      line: "  criSocket: {{ cri_socket }}"
+      backrefs: yes
+      state: present
+
+  - name: Change kubernetes version in config file to 1.20.1
+    lineinfile:
+      path: "{{ cluster_config }}"
+      regexp: 'kubernetesVersion'
+      line: "kubernetesVersion: v1.20.1"
+      backrefs: yes
+      state: present
+
+  - name: Change cidr of serviceSubnet
+    lineinfile:
+      path: "{{ cluster_config }}"
+      insertafter: '.*serviceSubnet'
+      line: '  podSubnet: 192.168.0.0/16'
+      state: present
+
+  - name: Set the cgroupDriver to systemd
+    blockinfile:
+      path: "{{ cluster_config }}"
+      block: |
+        ---
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        cgroupDriver: systemd
+
+  - name: Kube init process
+    shell: "kubeadm init --config {{ cluster_config }} --cri-socket {{ cri_socket }}"
+    ignore_errors: yes
+    args:
+      creates: "{{ kube_config }}"
+
+  - name: Create config dir on control plane
+    file:
+      path: /root/.kube
+      state: directory
+
+  - name: Copy kube config to root home
+    copy:
+      src: "{{ kube_config }}"
+      dest: "/root/.kube/config"
+      remote_src: yes
+
+  - name: Apply Calico.yaml
+    shell: "kubectl apply -f {{ calico_yaml }} && touch {{ calico_created }}"
+    args:
+      creates: "{{ calico_created }}"
+    environment:
+      KUBECONFIG: "{{ kube_config }}"
+    
+
+- name: Join nodes to control plane
+  hosts: all
+  gather_facts: yes
+  become: yes
+  become_user: root
+  vars:
+    cp_hostname: cp-cp1
+    node_joined: /etc/kubernetes/node.joined
+
+  tasks:
+  - name: Create Join command
+    shell: kubeadm token create --print-join-command
+    register: create_join_command
+    delegate_to: "{{ cp_hostname }}"
+
+  - name: Set join command as a fact
+    set_fact: 
+      join_command: "{{ create_join_command.stdout }}"
+
+  - name: Nodes join the cluster with join command
+    shell: "{{ join_command }} && touch {{ node_joined }}"
+    when: inventory_hostname != cp_hostname
+    args:
+      creates: "{{ node_joined }}"
