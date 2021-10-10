@@ -5,18 +5,25 @@
   become_user: root
   vars:
     version: 1.20.1-00
-
-  tasks:
-  - name: Update Hosts File
-    lineinfile:
-      path: /etc/hosts 
-      line: "{{ item.ip }} {{ item.name }}"
-    loop:
+    host_info:
       - { name: 'cp-cp1', ip: '192.168.33.10'}
       - { name: 'c1-node1', ip: '192.168.33.11'}
       - { name: 'c1-node2', ip: '192.168.33.12'}
       - { name: 'c1-node3', ip: '192.168.33.13'}
-    when: inventory_hostname != item.name
+
+  tasks:
+  - name: Make sure group wheel is not in the sudoers configuration
+    lineinfile:
+      path: /etc/hosts
+      state: absent
+      regexp: '.*{{ item.name }}.*'
+    loop: "{{ host_info }}"
+
+  - name: Update Hosts File
+    lineinfile:
+      path: /etc/hosts 
+      line: "{{ item.ip }} {{ item.name }}"
+    loop: "{{ host_info }}"
 
   - name: Disable SWAP since kubernetes can't work with swap enabled (1/2)
     shell: swapoff -a
@@ -208,11 +215,11 @@
       backrefs: yes
       state: present
 
-  - name: Change cidr of serviceSubnet
+  - name: Change cidr of podSubnet
     lineinfile:
       path: "{{ cluster_config }}"
       insertafter: '.*serviceSubnet'
-      line: '  podSubnet: 192.168.0.0/16'
+      line: '  podSubnet: 10.100.0.0/12'
       state: present
 
   - name: Set the cgroupDriver to systemd
@@ -223,6 +230,7 @@
         apiVersion: kubelet.config.k8s.io/v1beta1
         kind: KubeletConfiguration
         cgroupDriver: systemd
+        enableDebuggingHandlers: true
 
   - name: Kube init process
     shell: "kubeadm init --config {{ cluster_config }} --cri-socket {{ cri_socket }}"
@@ -241,20 +249,17 @@
       dest: "/root/.kube/config"
       remote_src: yes
 
+  - name: Apply Calico.yaml
+    shell: "kubectl apply -f {{ calico_yaml }} && touch {{ calico_created }}"
+    args:
+      creates: "{{ calico_created }}"
+
   - name: Fetch kube-config to local
     fetch:
       src: "{{ kube_config }}"
       dest: kube-config
       flat: yes
-
-  - name: Apply Calico.yaml
-    shell: "kubectl apply -f {{ calico_yaml }} && touch {{ calico_created }}"
-    args:
-      creates: "{{ calico_created }}"
-    environment:
-      KUBECONFIG: "{{ kube_config }}"
     
-
 - name: Join nodes to control plane
   hosts: all
   gather_facts: yes
@@ -279,3 +284,76 @@
     when: inventory_hostname != cp_hostname
     args:
       creates: "{{ node_joined }}"
+
+- name: Metallb/Istio Configuration
+  hosts:
+    cp-cp1
+  gather_facts: yes
+  become: yes
+  become_user: root
+  vars:
+    metallb_version: v0.10.3
+    metallb_config: /config/metallb-config.yaml
+    istio_version: 1.11.3
+
+  tasks:
+  - name: wait for all pods to come up before applying Calico
+    shell: &wait kubectl get pods -A -o json
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 20
+    delay: 10
+
+  - name: wait for Calico pods to come up
+    shell: *wait
+
+  - name: Create metallb namespace
+    shell: "kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/manifests/namespace.yaml"
+
+  - name: Create metallb resources
+    shell: "kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/manifests/metallb.yaml"
+
+  - name: Create metallb config file
+    blockinfile:
+      path: "{{ metallb_config }}"
+      create: yes
+      block: |
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          namespace: metallb-system
+          name: config
+        data:
+          config: |
+            address-pools:
+            - name: default
+              protocol: layer2
+              addresses:
+              - 192.168.33.20-192.168.33.25
+
+  - name: Apply metallb config
+    shell: "kubectl apply -f {{ metallb_config }}"
+
+  - name: Waiting on metallb to come up
+    shell: *wait
+
+  - name: Delete istio folder if it exists
+    file:
+      state: absent
+      path: /tmp/istio
+
+  - name: Download Istio
+    shell: "curl -L https://istio.io/downloadIstio | ISTIO_VERSION={{ istio_version }} TARGET_ARCH=x86_64 sh - && mv istio-* istio"
+    args:
+      chdir: /tmp
+
+  - name: Copy istioctl to /usr/local/bin
+    copy:
+      src: "/tmp/istio/bin/istioctl"
+      dest: "/usr/local/bin/istioctl"
+      remote_src: yes
+      mode: '0770'
+
+  - name: Install istioctl demo profile
+    shell: "istioctl install --set profile=demo -y"
